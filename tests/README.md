@@ -52,10 +52,14 @@ wheel for this platform, so it falls back to a slow from-source build.
   it still pass the same test as before."
 - **`test_grind.py`** -- the base64 encoder against Python's `base64`
   module, and the suffix-matching/atomic-counter logic in the actual grind
-  kernel, checked by deriving a real batch of pubkeys, picking two of
-  their *actual* suffixes as the search targets, and confirming the
-  kernel flags exactly those two seeds and no others -- no brute-force
-  searching needed to construct the test.
+  kernel, checked by deriving a real batch of pubkeys, picking real
+  suffixes off it as the search targets, and confirming the kernel flags
+  exactly those seeds and no others -- no brute-force searching needed to
+  construct the test. Includes a dedicated mixed-length-targets test (a
+  3-char and a 15-char target searched for in the same dispatch), since
+  the kernel and host both need to agree on how target lengths are
+  represented -- see "Things this process actually caught" below for a
+  bug this exact concern turned up.
 - **`test_plumbing.py`** -- a trivial pass-through kernel, there only to
   prove the PyObjC/Metal/Hypothesis plumbing itself works before any real
   crypto code was written.
@@ -75,3 +79,17 @@ wheel for this platform, so it falls back to a slow from-source build.
   doesn't translate into proportionally more GPU parallelism. Closing that
   gap further would mean shrinking the kernel's per-thread register/stack
   footprint, not more precomputation.
+- When target lengths became variable instead of fixed, the Swift host
+  packed each target's length as a big-endian `UInt32` (the convention
+  used elsewhere in this codebase for the actual SSH wire format, where
+  big-endian really is required by the protocol) -- but the kernel reads
+  that buffer as a plain native `uint`, which is little-endian on this
+  hardware. Every length got corrupted into a huge garbage value and
+  silently skipped, so nothing ever matched. The pytest suite didn't catch
+  it, because its Python-side test harness packed the same buffer with
+  native byte order from the start (`struct.pack("I", ...)` with no
+  explicit endianness). Only a full Swift-level smoke test -- injecting a
+  known-matching seed and running the real compiled binary end-to-end --
+  caught it. That's why this project keeps doing that extra check after
+  any change to how the Swift host and the kernel agree on a buffer
+  layout, even when the kernel's own tests already pass.

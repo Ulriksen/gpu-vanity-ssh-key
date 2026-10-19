@@ -45,22 +45,32 @@ func parseArgs() -> Args {
 
 setbuf(stdout, nil)
 let args = parseArgs()
-let targetLen = 7
+let maxTargetLen = 32  // must match MAX_TARGET_LEN in fe25519.metal
+let maxTargets = 8     // must match MAX_TARGETS in fe25519.metal
+let base64Chars = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
 guard !args.suffixes.isEmpty else {
     fputs("""
-    usage: grind --suffixes=<comma-separated, 7 chars each> [--batch-size=N] [--out=DIR] [--comment=TEXT]
+    usage: grind --suffixes=<comma-separated targets> [--batch-size=N] [--out=DIR] [--comment=TEXT]
 
-    Each target must be exactly 7 base64 characters (A-Z a-z 0-9 + /), since
-    that's what the kernel is compiled to match against the end of your
-    public key. Example: --suffixes=/alice12,+Alice12
+    Each target is matched against the end of your public key's base64 and
+    can be any length from 1 to \(maxTargetLen) characters (base64 only:
+    A-Z a-z 0-9 + /) -- targets don't need to share a length. Up to
+    \(maxTargets) targets per run. Example: --suffixes=/alice12,+Alice12,ab
 
     \n
     """, stderr)
     exit(1)
 }
+guard args.suffixes.count <= maxTargets else {
+    fatalError("\(args.suffixes.count) targets given, but at most \(maxTargets) are supported per run")
+}
 for s in args.suffixes {
-    guard s.utf8.count == targetLen else {
-        fatalError("target '\(s)' is \(s.utf8.count) bytes, but the kernel is fixed at TARGET_LEN=\(targetLen)")
+    guard (1...maxTargetLen).contains(s.utf8.count) else {
+        fatalError("target '\(s)' is \(s.utf8.count) bytes; targets must be 1-\(maxTargetLen) characters")
+    }
+    guard s.allSatisfy({ base64Chars.contains($0) }) else {
+        fatalError("target '\(s)' contains a character that can never appear in base64 (only A-Z a-z 0-9 + / are valid) -- it could never match")
     }
 }
 
@@ -199,7 +209,20 @@ func verifyAndWrite(seed: Data, args: Args) -> Bool {
     return true
 }
 
-let targetsBuf = args.suffixes.reduce(into: Data()) { $0.append(contentsOf: $1.utf8) }
+// Each target gets its own fixed-size maxTargetLen slot (zero-padded; the
+// kernel only reads the first target_lens[t] bytes of it), so targets can
+// mix lengths freely in one run.
+let targetsBuf = args.suffixes.reduce(into: Data()) { acc, suffix in
+    var slot = Array(suffix.utf8)
+    slot += [UInt8](repeating: 0, count: maxTargetLen - slot.count)
+    acc.append(contentsOf: slot)
+}
+let targetLensBuf = args.suffixes.reduce(into: Data()) { acc, suffix in
+    // Native byte order here (not beBytes/big-endian): the kernel reads this
+    // as a plain `uint` buffer, not an SSH-wire-format length prefix.
+    var len = UInt32(suffix.utf8.count)
+    acc.append(contentsOf: withUnsafeBytes(of: &len) { Array($0) })
+}
 let maxMatches: UInt32 = 64
 
 guard let tableData = FileManager.default.contents(atPath: args.tablePath) else {
@@ -229,7 +252,7 @@ var lastReport = Date()
 // command-line tool has no run loop to drain the autorelease pool on its
 // own, so without this every iteration's Metal objects pile up and the
 // process's memory grows unboundedly.
-func runBatch(batchSize: Int, tableBuf: MTLBuffer, targetsBuf: Data, numTargets: UInt32, maxMatches: UInt32) -> (count: UInt32, matchedSeeds: [Data]) {
+func runBatch(batchSize: Int, tableBuf: MTLBuffer, targetsBuf: Data, targetLensBuf: Data, numTargets: UInt32, maxMatches: UInt32) -> (count: UInt32, matchedSeeds: [Data]) {
     let seeds = randomBytes(batchSize * 32)
     var numTargetsVar = numTargets
     var maxMatchesVar = maxMatches
@@ -237,6 +260,7 @@ func runBatch(batchSize: Int, tableBuf: MTLBuffer, targetsBuf: Data, numTargets:
     guard
         let seedsBuf = device.makeBuffer(bytes: (seeds as NSData).bytes, length: seeds.count, options: .storageModeShared),
         let targetsBufMTL = device.makeBuffer(bytes: (targetsBuf as NSData).bytes, length: max(targetsBuf.count, 1), options: .storageModeShared),
+        let targetLensBufMTL = device.makeBuffer(bytes: (targetLensBuf as NSData).bytes, length: max(targetLensBuf.count, 1), options: .storageModeShared),
         let countBuf = device.makeBuffer(length: 4, options: .storageModeShared),
         let matchesBuf = device.makeBuffer(length: Int(maxMatches) * 32, options: .storageModeShared),
         let numTargetsBuf = device.makeBuffer(bytes: &numTargetsVar, length: 4, options: .storageModeShared),
@@ -256,10 +280,11 @@ func runBatch(batchSize: Int, tableBuf: MTLBuffer, targetsBuf: Data, numTargets:
     enc.setBuffer(seedsBuf, offset: 0, index: 0)
     enc.setBuffer(tableBuf, offset: 0, index: 1)
     enc.setBuffer(targetsBufMTL, offset: 0, index: 2)
-    enc.setBuffer(numTargetsBuf, offset: 0, index: 3)
-    enc.setBuffer(countBuf, offset: 0, index: 4)
-    enc.setBuffer(matchesBuf, offset: 0, index: 5)
-    enc.setBuffer(maxMatchesBuf, offset: 0, index: 6)
+    enc.setBuffer(targetLensBufMTL, offset: 0, index: 3)
+    enc.setBuffer(numTargetsBuf, offset: 0, index: 4)
+    enc.setBuffer(countBuf, offset: 0, index: 5)
+    enc.setBuffer(matchesBuf, offset: 0, index: 6)
+    enc.setBuffer(maxMatchesBuf, offset: 0, index: 7)
 
     let tgSize = min(batchSize, pipeline.maxTotalThreadsPerThreadgroup)
     enc.dispatchThreads(MTLSize(width: batchSize, height: 1, depth: 1),
@@ -282,7 +307,7 @@ func runBatch(batchSize: Int, tableBuf: MTLBuffer, targetsBuf: Data, numTargets:
 
 searchLoop: while true {
     let (count, matchedSeeds) = autoreleasepool {
-        runBatch(batchSize: args.batchSize, tableBuf: tableBuf, targetsBuf: targetsBuf, numTargets: UInt32(args.suffixes.count), maxMatches: maxMatches)
+        runBatch(batchSize: args.batchSize, tableBuf: tableBuf, targetsBuf: targetsBuf, targetLensBuf: targetLensBuf, numTargets: UInt32(args.suffixes.count), maxMatches: maxMatches)
     }
 
     totalTries += UInt64(args.batchSize)

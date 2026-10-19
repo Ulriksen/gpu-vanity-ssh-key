@@ -52,12 +52,15 @@ line tools (`xcode-select --install` if you don't have `swiftc` yet).
 ./grind --suffixes=/alice12,+Alice12
 ```
 
-- `--suffixes` (required): comma-separated list of targets. **Each one
-  must be exactly 7 characters**, using only base64 characters
-  (`A-Z a-z 0-9 + /`) -- that's what the kernel is compiled to compare
-  against the last 7 characters of your public key's base64. You can list
-  several (e.g. both a `/` and `+` variant, or different capitalizations)
-  to search for any of them at once.
+- `--suffixes` (required): comma-separated list of targets, matched against
+  the end of your public key's base64. Each target can be **any length
+  from 1 to 32 characters**, using only base64 characters
+  (`A-Z a-z 0-9 + /`), and targets don't need to share a length -- you can
+  mix a short one with a long one in the same run. Up to 8 targets per
+  run. List several (e.g. both a `/` and `+` variant, or different
+  capitalizations) to search for any of them at once; shorter targets are
+  found faster, since each extra character multiplies the expected search
+  time by 64.
 - `--batch-size` (default 2,000,000): how many keys to generate per GPU
   dispatch. 1-2 million is a reasonable default on an M-series chip.
 - `--out` (default `.`): directory to write `id_ed25519` / `id_ed25519.pub`
@@ -77,8 +80,9 @@ keys/sec**, which works out to **days, not minutes** for a specific
 capitalization, `/` vs `+`) cuts that down proportionally -- 4 targets
 means a quarter of the expected wait.
 
-If you want something fast enough to find in minutes, go shorter -- see
-"Changing the target length" below.
+If you want something fast enough to find in minutes, pick a shorter
+target -- e.g. a 4-character suffix is ~64^3 times faster than 7, usually
+seconds to minutes.
 
 ### Running it in the background for days
 
@@ -131,14 +135,14 @@ actually use day to day.
 
 Check progress any time with `tail -f /path/to/output/dir/grind.log`.
 
-### Changing the target length
+### Target length limits
 
-The kernel is compiled with a fixed `TARGET_LEN` (7) in `fe25519.metal`,
-for simplicity -- all targets must share one length. To search for
-something shorter (faster) or longer (slower) than 7 characters, edit
-`#define TARGET_LEN 7` near the `k_grind` kernel and rebuild. Going from 7
-to 5 characters cuts the expected search time by roughly 4096x (64²); going
-to 8 multiplies it by 64.
+Targets can be 1-32 characters each (`MAX_TARGET_LEN` in `fe25519.metal`),
+up to 8 per run (`MAX_TARGETS`), and don't need to share a length. 32 is
+already far beyond anything realistically searchable -- these caps exist
+just to keep the kernel's per-target buffer small and fixed-size, not
+because of any deeper limitation. If you ever need more than 8 targets in
+one run, raise `MAX_TARGETS` in `fe25519.metal` and rebuild.
 
 ## How it works, briefly
 

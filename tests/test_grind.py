@@ -9,6 +9,8 @@ from metal_harness import MetalRunner
 settings.register_profile("gpu", deadline=None)
 settings.load_profile("gpu")
 
+MAX_TARGET_LEN = 32
+
 
 @pytest.fixture(scope="session")
 def runner():
@@ -36,9 +38,9 @@ def wire_b64(pub: bytes) -> str:
 
 
 def run_grind(runner, table_bytes, seeds, targets):
-    TARGET_LEN = 7
-    assert all(len(t) == TARGET_LEN for t in targets)
-    targets_buf = b"".join(t.encode() for t in targets)
+    assert all(1 <= len(t) <= MAX_TARGET_LEN for t in targets)
+    targets_buf = b"".join(t.encode().ljust(MAX_TARGET_LEN, b"\x00") for t in targets)
+    lens_buf = b"".join(struct.pack("I", len(t)) for t in targets)
     max_matches = 64
 
     pipeline = runner._pipeline("k_grind")
@@ -50,12 +52,13 @@ def run_grind(runner, table_bytes, seeds, targets):
     b_seeds = device.newBufferWithBytes_length_options_(b"".join(seeds), 32 * len(seeds), Metal.MTLResourceStorageModeShared)
     b_table = device.newBufferWithBytes_length_options_(table_bytes, len(table_bytes), Metal.MTLResourceStorageModeShared)
     b_targets = device.newBufferWithBytes_length_options_(targets_buf, len(targets_buf), Metal.MTLResourceStorageModeShared)
+    b_lens = device.newBufferWithBytes_length_options_(lens_buf, len(lens_buf), Metal.MTLResourceStorageModeShared)
     b_numt = device.newBufferWithBytes_length_options_(struct.pack("I", len(targets)), 4, Metal.MTLResourceStorageModeShared)
     b_count = device.newBufferWithBytes_length_options_(struct.pack("I", 0), 4, Metal.MTLResourceStorageModeShared)
     b_matches = device.newBufferWithBytes_length_options_(bytes(32 * max_matches), 32 * max_matches, Metal.MTLResourceStorageModeShared)
     b_maxm = device.newBufferWithBytes_length_options_(struct.pack("I", max_matches), 4, Metal.MTLResourceStorageModeShared)
 
-    for i, b in enumerate([b_seeds, b_table, b_targets, b_numt, b_count, b_matches, b_maxm]):
+    for i, b in enumerate([b_seeds, b_table, b_targets, b_lens, b_numt, b_count, b_matches, b_maxm]):
         enc.setBuffer_offset_atIndex_(b, 0, i)
 
     n = len(seeds)
@@ -96,6 +99,28 @@ def test_grind_finds_exactly_the_real_matches(runner, table_bytes):
     assert count == len(expected_indices)
     assert set(matched) == {seeds[idx] for idx in expected_indices}
     assert i1 in expected_indices and i2 in expected_indices
+
+
+def test_grind_mixed_length_targets_in_one_run(runner, table_bytes):
+    # The whole point of variable-length support: a short target and a long
+    # target searched for simultaneously in the same dispatch. Again, no
+    # brute force -- read real suffixes of different lengths off a real
+    # derived batch.
+    seeds = [os.urandom(32) for _ in range(2000)]
+    pubs = derive_batch_pubkeys(runner, table_bytes, seeds)
+    full = [wire_b64(p) for p in pubs]
+
+    i_short, i_long = 42, 999
+    short_target = full[i_short][-3:]   # 3 chars
+    long_target = full[i_long][-15:]    # 15 chars
+    targets = [short_target, long_target]
+
+    count, matched = run_grind(runner, table_bytes, seeds, targets)
+
+    expected_indices = {idx for idx, s in enumerate(full) if s.endswith(short_target) or s.endswith(long_target)}
+    assert count == len(expected_indices)
+    assert set(matched) == {seeds[idx] for idx in expected_indices}
+    assert i_short in expected_indices and i_long in expected_indices
 
 
 def test_grind_no_false_positives_on_plain_batch(runner, table_bytes):

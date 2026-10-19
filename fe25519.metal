@@ -919,21 +919,26 @@ kernel void k_base64_51(device const uchar* in [[buffer(0)]],
     for (int i = 0; i < 68; i++) out[id*68 + i] = lout[i];
 }
 
-// ---- grind kernel: derive, encode, check suffix against up to 8 fixed-length targets ----
-// All targets must share one length (true for our actual use: /harald,
-// /Harald, +harald, +Harald are all 7 chars) -- kept deliberately simple
-// rather than building a general variable-length matcher nothing else needs.
+// ---- grind kernel: derive, encode, check suffix against up to 8 independently-
+// lengthed targets ----
+// Each target gets its own fixed-size MAX_TARGET_LEN slot (padded, unused
+// tail ignored) plus its own entry in target_lens giving its real length --
+// so targets can mix lengths freely in one run (e.g. a short one alongside
+// a long one). 32 chars is a generous cap: the full key is 68 base64 chars,
+// and anything beyond ~12-15 chars is already far outside feasible search
+// time (64^15 alone dwarfs any realistic compute budget).
 
 #define MAX_TARGETS 8
-#define TARGET_LEN 7
+#define MAX_TARGET_LEN 32
 
 kernel void k_grind(device const uchar* seeds [[buffer(0)]],
                      constant uchar* table [[buffer(1)]],
-                     constant uchar* targets [[buffer(2)]],       // num_targets * TARGET_LEN bytes
-                     constant uint& num_targets [[buffer(3)]],
-                     device atomic_uint* match_count [[buffer(4)]],
-                     device uchar* match_seeds [[buffer(5)]],      // max_matches * 32 bytes
-                     constant uint& max_matches [[buffer(6)]],
+                     constant uchar* targets [[buffer(2)]],       // num_targets * MAX_TARGET_LEN bytes
+                     constant uint* target_lens [[buffer(3)]],    // num_targets entries
+                     constant uint& num_targets [[buffer(4)]],
+                     device atomic_uint* match_count [[buffer(5)]],
+                     device uchar* match_seeds [[buffer(6)]],      // max_matches * 32 bytes
+                     constant uint& max_matches [[buffer(7)]],
                      uint id [[thread_position_in_grid]]) {
     uchar lseed[32], pub[32];
     copy32(lseed, seeds + id*32);
@@ -949,9 +954,11 @@ kernel void k_grind(device const uchar* seeds [[buffer(0)]],
     base64_encode_51(b64, wire);
 
     for (uint t = 0; t < num_targets && t < MAX_TARGETS; t++) {
+        uint len = target_lens[t];
+        if (len == 0 || len > 68) continue;
         bool match = true;
-        for (uint k = 0; k < TARGET_LEN; k++) {
-            if (b64[68 - TARGET_LEN + k] != targets[t * TARGET_LEN + k]) { match = false; break; }
+        for (uint k = 0; k < len; k++) {
+            if (b64[68 - len + k] != targets[t * MAX_TARGET_LEN + k]) { match = false; break; }
         }
         if (match) {
             uint idx = atomic_fetch_add_explicit(match_count, 1u, memory_order_relaxed);
