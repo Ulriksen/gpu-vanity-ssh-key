@@ -768,23 +768,35 @@ inline void sha512_32(thread uchar* out64, thread const uchar* msg32) {
     ulong h0 = 0x6a09e667f3bcc908UL, h1 = 0xbb67ae8584caa73bUL, h2 = 0x3c6ef372fe94f82bUL, h3 = 0xa54ff53a5f1d36f1UL;
     ulong h4 = 0x510e527fade682d1UL, h5 = 0x9b05688c2b3e6c1fUL, h6 = 0x1f83d9abfb41bd6bUL, h7 = 0x5be0cd19137e2179UL;
 
-    ulong w[80];
+    // Rolling 16-entry message-schedule buffer instead of the full w[80]
+    // (640 bytes -> 128 bytes/thread). The recurrence only ever reads
+    // w[i-2], w[i-7], w[i-15], w[i-16], and crucially (i-16)&15 == i&15 --
+    // the slot about to be overwritten this round IS exactly the w[i-16]
+    // term, so it's read first, then overwritten in place for the future
+    // round that will need it as w[(i+16)-16].
+    ulong w[16];
     for (int i = 0; i < 16; i++) {
         int j = i * 8;
         w[i] = (ulong)block[j]<<56 | (ulong)block[j+1]<<48 | (ulong)block[j+2]<<40 | (ulong)block[j+3]<<32 |
                (ulong)block[j+4]<<24 | (ulong)block[j+5]<<16 | (ulong)block[j+6]<<8  | (ulong)block[j+7];
     }
-    for (int i = 16; i < 80; i++) {
-        ulong v1 = w[i-2];
-        ulong t1 = rotr64(v1, 19) ^ rotr64(v1, 61) ^ (v1 >> 6);
-        ulong v2 = w[i-15];
-        ulong t2 = rotr64(v2, 1) ^ rotr64(v2, 8) ^ (v2 >> 7);
-        w[i] = t1 + w[i-7] + t2 + w[i-16];
-    }
 
     ulong a=h0, b=h1, c=h2, d=h3, e=h4, f=h5, g=h6, h=h7;
     for (int i = 0; i < 80; i++) {
-        ulong t1 = h + (rotr64(e,14) ^ rotr64(e,18) ^ rotr64(e,41)) + ((e & f) ^ (~e & g)) + SHA512_K[i] + w[i];
+        int idx = i & 15;
+        ulong wi;
+        if (i < 16) {
+            wi = w[idx];
+        } else {
+            ulong v1 = w[(i-2)&15];
+            ulong t1s = rotr64(v1, 19) ^ rotr64(v1, 61) ^ (v1 >> 6);
+            ulong v2 = w[(i-15)&15];
+            ulong t2s = rotr64(v2, 1) ^ rotr64(v2, 8) ^ (v2 >> 7);
+            wi = t1s + w[(i-7)&15] + t2s + w[idx]; // w[idx] here is still the old w[i-16]
+            w[idx] = wi;
+        }
+
+        ulong t1 = h + (rotr64(e,14) ^ rotr64(e,18) ^ rotr64(e,41)) + ((e & f) ^ (~e & g)) + SHA512_K[i] + wi;
         ulong t2 = (rotr64(a,28) ^ rotr64(a,34) ^ rotr64(a,39)) + ((a & b) ^ (a & c) ^ (b & c));
         h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
     }

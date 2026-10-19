@@ -22,6 +22,11 @@ struct Args {
     var tablePath: String = "base_table.bin"
     var outDir: String = "."
     var comment: String = "vanity-key"
+    // 256 measured ~12% faster than the GPU-reported max (1024) on an M4:
+    // this kernel is register-heavy enough that the "maximum" threadgroup
+    // size actually hurts occupancy rather than helping it. --threadgroup-size
+    // overrides this if you want to re-tune for different hardware.
+    var threadgroupSize: Int = 256
 }
 
 func parseArgs() -> Args {
@@ -33,6 +38,7 @@ func parseArgs() -> Args {
         switch key {
         case "--suffixes": a.suffixes = value.split(separator: ",").map(String.init)
         case "--batch-size": a.batchSize = Int(value) ?? a.batchSize
+        case "--threadgroup-size": a.threadgroupSize = Int(value) ?? a.threadgroupSize
         case "--metal-src": a.metalSource = value
         case "--table": a.tablePath = value
         case "--out": a.outDir = value
@@ -252,7 +258,7 @@ var lastReport = Date()
 // command-line tool has no run loop to drain the autorelease pool on its
 // own, so without this every iteration's Metal objects pile up and the
 // process's memory grows unboundedly.
-func runBatch(batchSize: Int, tableBuf: MTLBuffer, targetsBuf: Data, targetLensBuf: Data, numTargets: UInt32, maxMatches: UInt32) -> (count: UInt32, matchedSeeds: [Data]) {
+func runBatch(batchSize: Int, tableBuf: MTLBuffer, targetsBuf: Data, targetLensBuf: Data, numTargets: UInt32, maxMatches: UInt32, threadgroupSize: Int) -> (count: UInt32, matchedSeeds: [Data]) {
     let seeds = randomBytes(batchSize * 32)
     var numTargetsVar = numTargets
     var maxMatchesVar = maxMatches
@@ -286,7 +292,7 @@ func runBatch(batchSize: Int, tableBuf: MTLBuffer, targetsBuf: Data, targetLensB
     enc.setBuffer(matchesBuf, offset: 0, index: 6)
     enc.setBuffer(maxMatchesBuf, offset: 0, index: 7)
 
-    let tgSize = min(batchSize, pipeline.maxTotalThreadsPerThreadgroup)
+    let tgSize = min(batchSize, min(threadgroupSize, pipeline.maxTotalThreadsPerThreadgroup))
     enc.dispatchThreads(MTLSize(width: batchSize, height: 1, depth: 1),
                          threadsPerThreadgroup: MTLSize(width: tgSize, height: 1, depth: 1))
     enc.endEncoding()
@@ -307,7 +313,7 @@ func runBatch(batchSize: Int, tableBuf: MTLBuffer, targetsBuf: Data, targetLensB
 
 searchLoop: while true {
     let (count, matchedSeeds) = autoreleasepool {
-        runBatch(batchSize: args.batchSize, tableBuf: tableBuf, targetsBuf: targetsBuf, targetLensBuf: targetLensBuf, numTargets: UInt32(args.suffixes.count), maxMatches: maxMatches)
+        runBatch(batchSize: args.batchSize, tableBuf: tableBuf, targetsBuf: targetsBuf, targetLensBuf: targetLensBuf, numTargets: UInt32(args.suffixes.count), maxMatches: maxMatches, threadgroupSize: args.threadgroupSize)
     }
 
     totalTries += UInt64(args.batchSize)

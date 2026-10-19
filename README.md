@@ -63,6 +63,13 @@ line tools (`xcode-select --install` if you don't have `swiftc` yet).
   time by 64.
 - `--batch-size` (default 2,000,000): how many keys to generate per GPU
   dispatch. 1-2 million is a reasonable default on an M-series chip.
+- `--threadgroup-size` (default 256): GPU threads per threadgroup.
+  Counterintuitively, smaller beats the GPU-reported maximum here (1024 on
+  an M4) by about 12% -- this kernel is register-heavy enough that the
+  "maximum" threadgroup size actually hurts occupancy. 256 was the
+  measured sweet spot on an M4; if you're re-tuning for different Apple
+  Silicon, sweep 32/64/128/256/512/1024 and see what your hardware likes
+  (see `tests/README.md` for the measurements behind this default).
 - `--out` (default `.`): directory to write `id_ed25519` / `id_ed25519.pub`
   into.
 - `--comment` (default `vanity-key`): comment embedded in the key.
@@ -74,7 +81,7 @@ until it finds a match.
 
 Expected number of tries is `(64^length) / (number of targets)`. For a
 single 7-character target, that's 64^7 ≈ 4.4 trillion tries on average.
-Measured throughput on an M-series Mac mini is roughly **650,000-700,000
+Measured throughput on an M4 Mac mini is roughly **700,000-750,000
 keys/sec**, which works out to **days, not minutes** for a specific
 7-character ending. Listing a few equivalent targets (different
 capitalization, `/` vs `+`) cuts that down proportionally -- 4 targets

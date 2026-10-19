@@ -93,3 +93,48 @@ wheel for this platform, so it falls back to a slow from-source build.
   caught it. That's why this project keeps doing that extra check after
   any change to how the Swift host and the kernel agree on a buffer
   layout, even when the kernel's own tests already pass.
+
+## Performance investigation (post-launch)
+
+Given the occupancy-bound finding above, a follow-up investigation looked
+for ways to actually reduce the kernel's per-thread footprint rather than
+its arithmetic operation count. Two things were tried, measured cleanly
+(production job paused, ~60-90s per measurement, same batch size and
+targets each time):
+
+- **Threadgroup size.** The host had always requested the GPU-reported
+  maximum (`pipeline.maxTotalThreadsPerThreadgroup`, 1024 on an M4). A
+  sweep of 32/64/128/256/512/1024 found that every size from 32 to 512
+  measured the same (~740-745k/s, within noise of each other), while 1024
+  measured a consistent ~657-663k/s -- about 12% *slower*. This directly
+  supports the occupancy-bound diagnosis: a register-heavy kernel at full
+  threadgroup width leaves fewer threadgroups able to be resident
+  concurrently per GPU core, so the "maximum" setting actively hurts
+  throughput. 256 is now the default (`--threadgroup-size`), a pure
+  host-side dispatch parameter with no kernel changes and no correctness
+  risk at all.
+- **SHA-512's message schedule.** `sha512_32` used to materialize the full
+  80-entry `ulong w[80]` (640 bytes/thread) even though the recurrence
+  only ever reads 4 specific prior entries. Replaced with a 16-entry
+  rolling buffer (128 bytes/thread) -- the kind of fixed-size,
+  wide-indexed local array SHA-512 produces is a known GPU anti-pattern,
+  likely to end up in actual per-thread stack memory rather than
+  registers. Re-verified against `hashlib.sha512` in isolation, then the
+  full suite, before measuring. Result: **no measurable change** (~740k/s
+  either way, once the threadgroup-size fix was already in place) --
+  an honest null result. Kept anyway since it's strictly smaller,
+  equally well-tested, and may matter more on different Apple Silicon
+  generations with tighter register files; reported here rather than
+  implied to have helped.
+
+Net effect: ~605k/s (original double-and-add) → ~663k/s (precomputed
+table) → **~740k/s (threadgroup-size fix)**, roughly 22% over the
+table-only version and about 41% over the original naive port.
+
+**What would likely help further, and why it wasn't pursued here:** real
+GPU register/occupancy profiling needs Xcode's GPU Frame Capture / Metal
+System Trace (Instruments), which requires the full Xcode install, not
+just the Command Line Tools used throughout this project. Without it,
+further register-pressure reduction (e.g. in the point-arithmetic
+temporaries) would be guesswork rather than measurement-driven, which is
+exactly the kind of unverified change this project has tried to avoid.
